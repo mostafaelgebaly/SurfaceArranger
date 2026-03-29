@@ -1,0 +1,628 @@
+{
+  "Uuid": "b2ac262c-f66d-4c57-939d-7df618bfa40b",
+  "IsCustomNode": true,
+  "Category": "Revit",
+  "Description": "arranges surfaces in a table with label area and creates the table ",
+  "Name": "SurfacesArranger",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# ═══════════════════════════════════════════════════════════════════════════════\r\n# Dynamo Python Script — Grid Layout with Rotation + Frame + Label Points\r\n# ───────────────────────────────────────────────────────────────────────────────\r\n# IN[0] = surfaces     list of Surface / PolySurface geometry\r\n# IN[1] = spacing      float  — gap between surfaces (also used as cell margin)\r\n# IN[2] = columns      int    — number of columns in the grid\r\n# IN[3] = label_band   float  — height of the label zone between double h-lines\r\n# ───────────────────────────────────────────────────────────────────────────────\r\n# OUT[0] = arranged + rotated surfaces\r\n# OUT[1] = vertical lines\r\n# OUT[2] = horizontal lines\r\n# OUT[3] = label center points\r\n# ═══════════════════════════════════════════════════════════════════════════════\r\n\r\nimport clr\r\nimport math\r\nclr.AddReference('ProtoGeometry')\r\nfrom Autodesk.DesignScript.Geometry import (\r\n    BoundingBox, Vector, CoordinateSystem, Line, Point, Plane\r\n)\r\n\r\n# ── Helper: flatten nested lists ──────────────────────────────────────────────\r\ndef flatten(obj):\r\n    if isinstance(obj, list):\r\n        for item in obj:\r\n            for sub in flatten(item):\r\n                yield sub\r\n    else:\r\n        yield obj\r\n\r\n# ── Helper: get all edges of a surface ────────────────────────────────────────\r\ndef get_edges(surface):\r\n    try:\r\n        return surface.Edges\r\n    except:\r\n        try:\r\n            return surface.GetEdges()\r\n        except:\r\n            return []\r\n\r\n# ── Helper: edge length ────────────────────────────────────────────────────────\r\ndef edge_length(edge):\r\n    try:\r\n        return edge.Length\r\n    except:\r\n        try:\r\n            c = edge.CurveGeometry\r\n            return c.Length\r\n        except:\r\n            return 0.0\r\n\r\n# ── Helper: edge direction vector (start → end) ───────────────────────────────\r\ndef edge_vector(edge):\r\n    try:\r\n        c = edge.CurveGeometry\r\n    except:\r\n        c = edge\r\n    sp = c.StartPoint\r\n    ep = c.EndPoint\r\n    dx = ep.X - sp.X\r\n    dy = ep.Y - sp.Y\r\n    length = math.sqrt(dx*dx + dy*dy)\r\n    if length < 1e-9:\r\n        return (1.0, 0.0)\r\n    return (dx / length, dy / length)\r\n\r\n# ── Helper: edge start point ───────────────────────────────────────────────────\r\ndef edge_start(edge):\r\n    try:\r\n        c = edge.CurveGeometry\r\n    except:\r\n        c = edge\r\n    return c.StartPoint\r\n\r\n# ── Rotate + orient surface so longest edge is on +X, surface in +XY plane ────\r\ndef orient_surface(surface):\r\n    edges = get_edges(surface)\r\n    if not edges:\r\n        return surface\r\n\r\n    # Find the longest edge\r\n    longest = max(edges, key=lambda e: edge_length(e))\r\n    ex, ey  = edge_vector(longest)\r\n\r\n    # Angle from longest edge to +X axis\r\n    angle_rad = math.atan2(ey, ex)       # angle of the edge in world XY\r\n    angle_deg = math.degrees(angle_rad)\r\n\r\n    # Rotate about the surface's bounding box center to align edge → +X\r\n    bb     = BoundingBox.ByGeometry(surface)\r\n    cx     = (bb.MinPoint.X + bb.MaxPoint.X) * 0.5\r\n    cy     = (bb.MinPoint.Y + bb.MaxPoint.Y) * 0.5\r\n    center = Point.ByCoordinates(cx, cy, 0.0)\r\n    normal = Vector.ByCoordinates(0, 0, 1)\r\n\r\n    rotated = surface.Rotate(center, normal, -angle_deg)\r\n\r\n    # After rotation check: if the surface's centroid Y > start-point Y of\r\n    # longest edge (i.e. surface is \"above\" the edge), it's resting correctly.\r\n    # If not, rotate 180° to flip it so it always rests ON the longest edge.\r\n    bb2  = BoundingBox.ByGeometry(rotated)\r\n    cy2  = (bb2.MinPoint.Y + bb2.MaxPoint.Y) * 0.5\r\n\r\n    # Re-find the longest edge start point after rotation to get its Y\r\n    edges2   = get_edges(rotated)\r\n    if edges2:\r\n        longest2 = max(edges2, key=lambda e: edge_length(e))\r\n        sp2      = edge_start(longest2)\r\n        edge_y   = sp2.Y\r\n\r\n        # If the body of the surface is below the edge, flip 180° around edge\r\n        if cy2 < edge_y:\r\n            cx2     = (bb2.MinPoint.X + bb2.MaxPoint.X) * 0.5\r\n            cy2_val = (bb2.MinPoint.Y + bb2.MaxPoint.Y) * 0.5\r\n            c2      = Point.ByCoordinates(cx2, cy2_val, 0.0)\r\n            rotated = rotated.Rotate(c2, normal, 180.0)\r\n\r\n    center.Dispose()\r\n    normal.Dispose()\r\n    return rotated\r\n\r\n# ── Inputs ────────────────────────────────────────────────────────────────────\r\nsurfaces   = list(flatten(IN[0]))\r\nspacing    = float(IN[1])\r\ncolumns    = int(IN[2])\r\nlabel_band = float(IN[3])\r\n\r\nif not surfaces:\r\n    OUT = [[], [], [], []]\r\n    raise Exception(\"IN[0] is empty.\")\r\n\r\n# ── Step 1: Orient all surfaces (longest edge → +X, rest on that edge) ────────\r\noriented = [orient_surface(s) for s in surfaces]\r\n\r\n# ── Step 2: Bounding boxes after rotation ─────────────────────────────────────\r\nbboxes  = [BoundingBox.ByGeometry(s) for s in oriented]\r\nwidths  = [bb.MaxPoint.X - bb.MinPoint.X for bb in bboxes]\r\nheights = [bb.MaxPoint.Y - bb.MinPoint.Y for bb in bboxes]\r\n\r\n# ── Step 3: Grid dimensions ────────────────────────────────────────────────────\r\nnum_surfaces = len(oriented)\r\n# Fix: actual number of rows needed — no empty trailing row\r\nnum_rows     = -(-num_surfaces // columns)\r\n\r\ncol_widths = []\r\nfor c in range(columns):\r\n    idx_in_col = [r * columns + c for r in range(num_rows)\r\n                  if (r * columns + c) < num_surfaces]\r\n    col_widths.append(max(widths[i]  for i in idx_in_col) if idx_in_col else 0.0)\r\n\r\nrow_heights = []\r\nfor r in range(num_rows):\r\n    idx_in_row = [r * columns + c for c in range(columns)\r\n                  if (r * columns + c) < num_surfaces]\r\n    row_heights.append(max(heights[i] for i in idx_in_row) if idx_in_row else 0.0)\r\n\r\n# ── Step 4: Cumulative positions in logical space (Y downward) ────────────────\r\n# Frame margin = spacing/2 on all sides — matches the half-gap between cells\r\n# so the distance from any surface to the frame equals the distance between\r\n# neighboring surfaces.\r\nmargin = spacing * 0.5\r\n\r\ncol_x = []\r\nx_acc = margin\r\nfor w in col_widths:\r\n    col_x.append(x_acc)\r\n    x_acc += w + spacing\r\n\r\nrow_y_logical = []\r\ny_acc = margin\r\nfor h in row_heights:\r\n    row_y_logical.append(y_acc)\r\n    y_acc += h + spacing + label_band\r\n\r\ntotal_logical_height = y_acc - spacing - label_band + margin\r\n#   last row consumed: h + spacing + label_band\r\n#   we remove the trailing spacing+label_band, add back the bottom margin\r\n\r\n# recalculate cleanly:\r\n# bottom of last label band = row_y_logical[-1] + row_heights[-1] + spacing/2 + label_band\r\n# bottom frame              = that + spacing/2  (= + margin)\r\nlast_row         = num_rows - 1\r\nbottom_label_B   = (row_y_logical[last_row] + row_heights[last_row]\r\n                    + margin + label_band)\r\ntotal_logical_height = bottom_label_B + margin\r\n\r\nframe_x0 = 0.0\r\nframe_x1 = x_acc - spacing + margin      # right margin = margin (not full spacing)\r\nz        = 0.0\r\n\r\n# ── Flip: logical Y (down) → Revit Y (up) ─────────────────────────────────────\r\ndef flip(y):\r\n    return total_logical_height - y\r\n\r\nframe_y0 = 0.0                            # bottom of frame in Revit\r\nframe_y1 = total_logical_height           # top of frame in Revit\r\n\r\n# ── Step 5: Translate oriented surfaces into grid cells ───────────────────────\r\narranged = []\r\nfor idx, surface in enumerate(oriented):\r\n    row = idx // columns\r\n    col = idx %  columns\r\n\r\n    mn = bboxes[idx].MinPoint\r\n\r\n    target_x = col_x[col]\r\n    # Bottom of this surface zone in Revit Y:\r\n    target_y = flip(row_y_logical[row] + row_heights[row])\r\n\r\n    dx = target_x - mn.X\r\n    dy = target_y - mn.Y\r\n    dz = -mn.Z\r\n\r\n    vec       = Vector.ByCoordinates(dx, dy, dz)\r\n    source_cs = CoordinateSystem.Identity()\r\n    target_cs = source_cs.Translate(vec)\r\n    moved     = surface.Transform(source_cs, target_cs)\r\n    arranged.append(moved)\r\n\r\n    vec.Dispose()\r\n    target_cs.Dispose()\r\n\r\n# ── Step 6: Vertical lines ────────────────────────────────────────────────────\r\nv_lines = []\r\n\r\ndef make_v_line(x):\r\n    p1 = Point.ByCoordinates(x, frame_y0, z)\r\n    p2 = Point.ByCoordinates(x, frame_y1, z)\r\n    ln = Line.ByStartPointEndPoint(p1, p2)\r\n    p1.Dispose(); p2.Dispose()\r\n    return ln\r\n\r\nv_lines.append(make_v_line(frame_x0))\r\nv_lines.append(make_v_line(frame_x1))\r\n\r\nfor c in range(columns - 1):\r\n    x_sep = col_x[c] + col_widths[c] + spacing * 0.5\r\n    v_lines.append(make_v_line(x_sep))\r\n\r\n# ── Step 7: Horizontal lines ──────────────────────────────────────────────────\r\nh_lines = []\r\n\r\ndef make_h_line(y):\r\n    p1 = Point.ByCoordinates(frame_x0, y, z)\r\n    p2 = Point.ByCoordinates(frame_x1, y, z)\r\n    ln = Line.ByStartPointEndPoint(p1, p2)\r\n    p1.Dispose(); p2.Dispose()\r\n    return ln\r\n\r\nh_lines.append(make_h_line(frame_y0))\r\nh_lines.append(make_h_line(frame_y1))\r\n\r\nlabel_center_y_per_row = []\r\n\r\nfor r in range(num_rows):\r\n    logical_surf_bot = row_y_logical[r] + row_heights[r]\r\n    logical_A        = logical_surf_bot + margin          # top divider (closer to surface)\r\n    logical_B        = logical_A        + label_band      # bottom divider\r\n\r\n    revit_A = flip(logical_A)\r\n    revit_B = flip(logical_B)\r\n\r\n    h_lines.append(make_h_line(revit_A))\r\n    h_lines.append(make_h_line(revit_B))\r\n    label_center_y_per_row.append((revit_A + revit_B) * 0.5)\r\n\r\n# ── Step 8: Label center points ───────────────────────────────────────────────\r\nlabel_points = []\r\nfor idx in range(num_surfaces):\r\n    row = idx // columns\r\n    col = idx %  columns\r\n    pt  = Point.ByCoordinates(\r\n              col_x[col] + col_widths[col] * 0.5,\r\n              label_center_y_per_row[row],\r\n              z)\r\n    label_points.append(pt)\r\n\r\n# ── Output ────────────────────────────────────────────────────────────────────\r\nOUT = [arranged, v_lines, h_lines, label_points]\r\n",
+      "Engine": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "547cc383d6eb4a00b5bd0a7e2bccd770",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "d4bf30a141d746618c4ff0ecd6b5ea36",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "aebe6387283f4260874820ac6ec10995",
+          "Name": "IN[1]",
+          "Description": "Input #1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "9f9753921f0145858673647f73d9552a",
+          "Name": "IN[2]",
+          "Description": "Input #2",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "dca71aa905ef4b3282d400bbc5af4045",
+          "Name": "IN[3]",
+          "Description": "Input #3",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "c722b60eb99b48d0922e43b0cd152867",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Symbol, DynamoCore",
+      "Parameter": {
+        "Name": "surface",
+        "TypeName": "var",
+        "TypeRank": -1,
+        "DefaultValue": null,
+        "Description": ""
+      },
+      "Id": "1018f5cfed5c4f6386ff006502931ef7",
+      "NodeType": "InputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "b03d11777a824c8c8563b27cef3f308a",
+          "Name": "",
+          "Description": "Input Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "A function parameter, use with custom nodes.\r\n\r\nYou can specify the type and default value for parameter. E.g.,\r\n\r\ninput : var[]..[]\r\nvalue : bool = false"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Symbol, DynamoCore",
+      "Parameter": {
+        "Name": "spacing",
+        "TypeName": "double",
+        "TypeRank": 0,
+        "DefaultValue": null,
+        "Description": ""
+      },
+      "Id": "74b1ce952a974e098c13fd5b458a8d3a",
+      "NodeType": "InputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "7a9741c475294afab926de17dd96c595",
+          "Name": "",
+          "Description": "Input Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "A function parameter, use with custom nodes.\r\n\r\nYou can specify the type and default value for parameter. E.g.,\r\n\r\ninput : var[]..[]\r\nvalue : bool = false"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Symbol, DynamoCore",
+      "Parameter": {
+        "Name": "columns",
+        "TypeName": "double",
+        "TypeRank": 0,
+        "DefaultValue": null,
+        "Description": ""
+      },
+      "Id": "298e922d42b847a69892dcf6de6a9259",
+      "NodeType": "InputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "d6c15fef9d6d467492ab977dd048b781",
+          "Name": "",
+          "Description": "Input Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "A function parameter, use with custom nodes.\r\n\r\nYou can specify the type and default value for parameter. E.g.,\r\n\r\ninput : var[]..[]\r\nvalue : bool = false"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Symbol, DynamoCore",
+      "Parameter": {
+        "Name": "labelbandsize",
+        "TypeName": "double",
+        "TypeRank": 0,
+        "DefaultValue": null,
+        "Description": ""
+      },
+      "Id": "db75ee27b58d4d2b8506976d513fa26d",
+      "NodeType": "InputNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "a1e9506fd7dd40df991a18385745f5e2",
+          "Name": "",
+          "Description": "Input Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "A function parameter, use with custom nodes.\r\n\r\nYou can specify the type and default value for parameter. E.g.,\r\n\r\ninput : var[]..[]\r\nvalue : bool = false"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Output, DynamoCore",
+      "ElementResolver": null,
+      "Symbol": "surfaces",
+      "Id": "b83fe503f4df4a69ac4104b19209babe",
+      "NodeType": "OutputNode",
+      "Inputs": [
+        {
+          "Id": "62c1eeb230344f229af15a91336a042c",
+          "Name": "",
+          "Description": "Output Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [],
+      "Replication": "Disabled",
+      "Description": "A function output, use with custom nodes"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "dcc196cb4f93458882e92bb46be81307",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "4d4e9216ffae4e39a7c3c3f099b268fd",
+          "Name": "list",
+          "Description": "List to fetch an item from.\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "1f424b42ee4747ed93efeb0485e1537d",
+          "Name": "index",
+          "Description": "Index of the item to be fetched.\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "e62cb0461530478f9e4527199bc0b156",
+          "Name": "item",
+          "Description": "Item in the list at the given index.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "Returns an item from the given list that's located at the specified index.\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CodeBlockNodeModel, DynamoCore",
+      "Id": "a388f106ad98434bb45935d4b492ed00",
+      "NodeType": "CodeBlockNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "ad825414077940e689205310dfe068f9",
+          "Name": "",
+          "Description": "Value of expression at line 1",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "76396d64f36e42c1927ed7fc60696997",
+          "Name": "",
+          "Description": "Value of expression at line 2",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "6b4457f0cf30431fbf65868a6b98c111",
+          "Name": "",
+          "Description": "Value of expression at line 3",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Allows for DesignScript code to be authored directly",
+      "Code": "0;\n[1,2];\n3;"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "63a4c1b7659844029c1185e6dcc70cf4",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "e7847c9c4ff14e6a9234555b8651f4c3",
+          "Name": "list",
+          "Description": "List to fetch an item from.\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "52caabb7df224cc696f010b5ab375519",
+          "Name": "index",
+          "Description": "Index of the item to be fetched.\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "047e9bd221db42cd89aeae939d122a84",
+          "Name": "item",
+          "Description": "Item in the list at the given index.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "Returns an item from the given list that's located at the specified index.\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.ZeroTouch.DSFunction, DynamoCore",
+      "Id": "e5bbb5a39fc14121bf639d488af83cd5",
+      "NodeType": "FunctionNode",
+      "Inputs": [
+        {
+          "Id": "2d6a8514729b4886b015eb96399c39c8",
+          "Name": "list",
+          "Description": "List to fetch an item from.\n\nvar[]..[]",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        },
+        {
+          "Id": "f174e6230ba341e2be45fef030fc4d43",
+          "Name": "index",
+          "Description": "Index of the item to be fetched.\n\nint",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "e82226223b314aeebec4a475c82e87d0",
+          "Name": "item",
+          "Description": "Item in the list at the given index.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "FunctionSignature": "DSCore.List.GetItemAtIndex@var[]..[],int",
+      "Replication": "Auto",
+      "Description": "Returns an item from the given list that's located at the specified index.\n\nList.GetItemAtIndex (list: var[]..[], index: int): var[]..[]"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Output, DynamoCore",
+      "ElementResolver": null,
+      "Symbol": "lines",
+      "Id": "c27146396d394af99bde50ed33adec95",
+      "NodeType": "OutputNode",
+      "Inputs": [
+        {
+          "Id": "713635189db94471b2035a8eab23cad7",
+          "Name": "",
+          "Description": "Output Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [],
+      "Replication": "Disabled",
+      "Description": "A function output, use with custom nodes"
+    },
+    {
+      "ConcreteType": "Dynamo.Graph.Nodes.CustomNodes.Output, DynamoCore",
+      "ElementResolver": null,
+      "Symbol": "Labellocation",
+      "Id": "73ecd7dd75ad4ce7b46ca396e62813e3",
+      "NodeType": "OutputNode",
+      "Inputs": [
+        {
+          "Id": "d0b6db41f86f4b5397117823257c1a00",
+          "Name": "",
+          "Description": "Output Data",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [],
+      "Replication": "Disabled",
+      "Description": "A function output, use with custom nodes"
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "c722b60eb99b48d0922e43b0cd152867",
+      "End": "4d4e9216ffae4e39a7c3c3f099b268fd",
+      "Id": "1c08b0c5c346449eae5262e40e809772",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c722b60eb99b48d0922e43b0cd152867",
+      "End": "e7847c9c4ff14e6a9234555b8651f4c3",
+      "Id": "182034789b0f4eeea068946c72237f96",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "c722b60eb99b48d0922e43b0cd152867",
+      "End": "2d6a8514729b4886b015eb96399c39c8",
+      "Id": "51561d8a1b494921a2ca56d8462707ab",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "b03d11777a824c8c8563b27cef3f308a",
+      "End": "d4bf30a141d746618c4ff0ecd6b5ea36",
+      "Id": "9df98b4a21fa417fb7089a7b9cb3d71d",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "7a9741c475294afab926de17dd96c595",
+      "End": "aebe6387283f4260874820ac6ec10995",
+      "Id": "7677708ca0854abe8d2a82b74f65bfdc",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "d6c15fef9d6d467492ab977dd048b781",
+      "End": "9f9753921f0145858673647f73d9552a",
+      "Id": "2e74539034044d709eb8c3af1dbdb395",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "a1e9506fd7dd40df991a18385745f5e2",
+      "End": "dca71aa905ef4b3282d400bbc5af4045",
+      "Id": "45e3fee8149d47248c0f776d4047b512",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "e62cb0461530478f9e4527199bc0b156",
+      "End": "62c1eeb230344f229af15a91336a042c",
+      "Id": "4b9b7cd1635b4a69ad640d389f1b1359",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "ad825414077940e689205310dfe068f9",
+      "End": "1f424b42ee4747ed93efeb0485e1537d",
+      "Id": "64e0ca3bba2b46409950e8d65136e4f8",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "76396d64f36e42c1927ed7fc60696997",
+      "End": "52caabb7df224cc696f010b5ab375519",
+      "Id": "676d412d62014a8e99ccee02cb2567f7",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "6b4457f0cf30431fbf65868a6b98c111",
+      "End": "f174e6230ba341e2be45fef030fc4d43",
+      "Id": "0c296ed99c59471fb951a4eb47cee1b8",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "047e9bd221db42cd89aeae939d122a84",
+      "End": "713635189db94471b2035a8eab23cad7",
+      "Id": "ce649015f7204f8f9b652c68ff4110f0",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "e82226223b314aeebec4a475c82e87d0",
+      "End": "d0b6db41f86f4b5397117823257c1a00",
+      "Id": "6069f2768e664e2e88690bbe931612e3",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Author": "None provided",
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": false,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "3.3.0.6316",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17126.451171875,
+      "EyeY": 43158.80078125,
+      "EyeZ": 98883.8515625,
+      "LookX": 55814.1953125,
+      "LookY": -31946.3203125,
+      "LookZ": -74909.484375,
+      "UpX": 0.06763623654842377,
+      "UpY": 0.9935718774795532,
+      "UpZ": -0.09077616035938263
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "547cc383d6eb4a00b5bd0a7e2bccd770",
+        "Name": "Rotate",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": false,
+        "X": 791.3333333333334,
+        "Y": 275.33333333333337
+      },
+      {
+        "Id": "1018f5cfed5c4f6386ff006502931ef7",
+        "Name": "Input",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 360.33333333333326,
+        "Y": 195.0
+      },
+      {
+        "Id": "74b1ce952a974e098c13fd5b458a8d3a",
+        "Name": "Input",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 359.6666666666665,
+        "Y": 319.0
+      },
+      {
+        "Id": "298e922d42b847a69892dcf6de6a9259",
+        "Name": "Input",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 359.6666666666665,
+        "Y": 459.0
+      },
+      {
+        "Id": "db75ee27b58d4d2b8506976d513fa26d",
+        "Name": "Input",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 340.9999999999998,
+        "Y": 603.6666666666666
+      },
+      {
+        "Id": "b83fe503f4df4a69ac4104b19209babe",
+        "Name": "Output",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1462.0,
+        "Y": 250.66666666666674
+      },
+      {
+        "Id": "dcc196cb4f93458882e92bb46be81307",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1085.3333333333333,
+        "Y": 255.33333333333343
+      },
+      {
+        "Id": "a388f106ad98434bb45935d4b492ed00",
+        "Name": "Code Block",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 885.9999999999999,
+        "Y": 512.6666666666667
+      },
+      {
+        "Id": "63a4c1b7659844029c1185e6dcc70cf4",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1090.0,
+        "Y": 405.33333333333337
+      },
+      {
+        "Id": "e5bbb5a39fc14121bf639d488af83cd5",
+        "Name": "List.GetItemAtIndex",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1096.6666666666665,
+        "Y": 562.6666666666669
+      },
+      {
+        "Id": "c27146396d394af99bde50ed33adec95",
+        "Name": "Output",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1462.0,
+        "Y": 403.33333333333337
+      },
+      {
+        "Id": "73ecd7dd75ad4ce7b46ca396e62813e3",
+        "Name": "Output",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 1464.6666666666667,
+        "Y": 568.6666666666667
+      }
+    ],
+    "Annotations": [],
+    "X": -112.66666666666674,
+    "Y": 16.0,
+    "Zoom": 1.0
+  }
+}
